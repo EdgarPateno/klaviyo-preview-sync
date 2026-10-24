@@ -12,7 +12,7 @@ Usage:
 
 Safety (both modes):
   * only Draft campaigns are modified (status re-checked right before each PATCH);
-  * block text that is empty, contains "[REPLACE]" or starts with "Preview text" is refused unless --force
+  * block text that is empty or contains "[REPLACE]" (the base-template placeholder) is refused unless --force
     (--all-drafts never forces);
   * each message is re-read right before its PATCH and skipped if its definition changed since the first read;
   * after the PATCH the whole definition (minus content.preview_text) is compared with the pre-PATCH read;
@@ -63,7 +63,7 @@ ROTATE_PER_RUN = 5     # non-block messages re-checked per run
 SEED_PER_RUN = int(os.environ.get("SYNC_SEED_PER_RUN", "15"))  # uncached messages fetched per run
 # invisible characters used in the preheader padding / that may trail the text
 INVISIBLE = "\u200c\u00a0\u200b\u034f\u200a\ufeff\u00ad\u2060\u200d"
-PLACEHOLDER_RE = re.compile(r"\[REPLACE\]|^Preview text\b", re.I)
+PLACEHOLDER_RE = re.compile(r"\[REPLACE\]", re.I)
 QUIET = False
 # Public CI logs: SYNC_REDACT=1 hides campaign names, labels, preview text and API error bodies.
 REDACT = os.environ.get("SYNC_REDACT") == "1"
@@ -385,6 +385,9 @@ def run_all_drafts(apply):
     state = load_state()
     if time.time() < state.get("backoff_until", 0):
         return 0
+    if state.get("rules") != PLACEHOLDER_RE.pattern:
+        state["messages"] = {}               # cached placeholder flags were computed under other rules
+        state["rules"] = PLACEHOLDER_RE.pattern
     cache = state.setdefault("messages", {})
     failures = 0
     deadline = time.time() + TIME_BUDGET

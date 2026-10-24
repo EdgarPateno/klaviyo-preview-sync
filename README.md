@@ -13,7 +13,7 @@ editor, and this job copies its text into the field so the campaign screen shows
   demand via **Actions > Sync preview text > Run workflow**.
 - Only **Draft** email campaigns are touched, only the Preview text field is written, and template html is
   never changed.
-- Empty block text, `[REPLACE]` and text starting with "Preview text" are never copied.
+- Empty block text and the base-template placeholder `[REPLACE]` are never copied.
 - Each message is re-read right before the update and skipped if someone changed it in the meantime.
 
 ## Setup
