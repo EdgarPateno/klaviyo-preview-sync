@@ -1,7 +1,7 @@
 # klaviyo-preview-sync
 
 Keeps the Klaviyo campaign **Preview text** field in step with the hidden yellow preview block in
-Magnum's hybrid email templates.
+hybrid (drag-and-drop + custom HTML) email templates.
 
 Klaviyo ignores the Preview text field for these templates; inboxes show the hidden
 `<div class="mg-preheader">` block at the top of the email. Editors change that block in the email

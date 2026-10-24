@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Sync Klaviyo campaign Preview text FIELDS to the editable hidden preview block in hybrid templates.
 
-Hybrid (USER_DRAGGABLE) Magnum templates ignore the campaign "Preview text" field; Gmail shows the
+Hybrid (USER_DRAGGABLE) templates ignore the campaign "Preview text" field; Gmail shows the
 hidden <div class="mg-preheader"> block instead. This tool makes the field match the block so the
 Klaviyo UI / reports show what inboxes actually show.
 
 Usage:
     python3 sync_preview_text.py <campaign_id>                       # dry run (default): report only
     python3 sync_preview_text.py <campaign_id> --apply [--force]     # PATCH each DIFF message's preview_text
-    python3 sync_preview_text.py --all-drafts [--apply] [--quiet]    # every Draft email campaign (launchd poller)
+    python3 sync_preview_text.py --all-drafts [--apply] [--quiet]    # every Draft email campaign (scheduled job)
 
 Safety (both modes):
   * only Draft campaigns are modified (status re-checked right before each PATCH);
@@ -25,9 +25,14 @@ Safety (both modes):
     SYNC_SEED_PER_RUN (default 15) per run; state lives in .sync_state.json next to this script
     (persisted between Actions runs with actions/cache);
   * HTTP 429 -> back off (Retry-After, min 120 s) and exit 0; a lock file makes overlapping runs exit at once;
-  * a template that Klaviyo itself cannot load (HTTP 4xx) is logged as WARN and not counted as a failure;
+  * a template that Klaviyo itself cannot load (HTTP 404/422) is logged as WARN and not counted as a failure;
+    any other 4xx (e.g. 401/403 after a key-scope change) is an ERROR;
+  * the template html is re-read right before each write, so a stale cache is never written;
+  * each run stops after SYNC_TIME_BUDGET seconds (default 170) and saves its progress;
+  * SYNC_REDACT=1 (set in the public workflow) keeps campaign names, labels and preview text out of the logs;
   * --quiet logs only changes and errors (timestamped, one line each) to sync_preview_text.log (capped ~1 MB).
-Exit status is non-zero if any API call or apply failed (except a clean 429 back-off and 4xx template reads).
+Exit status is non-zero if any API call or apply failed (except parked 404/422 template reads), or after
+3 consecutive 429 back-offs.
 
 Stdlib only, Python 3.9+. Reads the private key from the KLAVIYO_API_KEY environment variable (GitHub secret),
 falling back to ~/.claude.json (mcpServers.klaviyo.env.KLAVIYO_API_KEY) for local runs; never prints it.
@@ -35,6 +40,7 @@ falling back to ~/.claude.json (mcpServers.klaviyo.env.KLAVIYO_API_KEY) for loca
 import copy
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -56,9 +62,29 @@ LOG_CAP = 1_000_000
 ROTATE_PER_RUN = 5     # non-block messages re-checked per run
 SEED_PER_RUN = int(os.environ.get("SYNC_SEED_PER_RUN", "15"))  # uncached messages fetched per run
 # invisible characters used in the preheader padding / that may trail the text
-INVISIBLE = "‌ ​͏ ﻿"
+INVISIBLE = "\u200c\u00a0\u200b\u034f\u200a\ufeff\u00ad\u2060\u200d"
 PLACEHOLDER_RE = re.compile(r"\[REPLACE\]|^Preview text\b", re.I)
 QUIET = False
+# Public CI logs: SYNC_REDACT=1 hides campaign names, labels, preview text and API error bodies.
+REDACT = os.environ.get("SYNC_REDACT") == "1"
+TIME_BUDGET = int(os.environ.get("SYNC_TIME_BUDGET", "170"))   # seconds per --all-drafts run
+PARK_STATUSES = {404, 422}   # template reads Klaviyo itself can't serve: WARN, not failure
+MAX_BACKOFFS = 3             # consecutive 429 back-offs before a run exits non-zero
+MAX_SAME_FAILURES = 3        # same block text failing this often -> paused until the block changes
+SKIP_PREFIX = "skip: "       # patch_preview results that are benign skips, not failures
+
+
+def nm(value):
+    return "<redacted>" if REDACT else repr(value)
+
+
+def fp(text):
+    """Short fingerprint of block text for the cache; None stays None."""
+    return None if text is None else hashlib.sha256(text.encode()).hexdigest()[:20]
+
+
+def txt(value):
+    return f"<{len(value or '')} chars>" if REDACT else repr(value)
 
 
 def _key():
@@ -142,6 +168,8 @@ def api(method, path, body=None):
 def describe(status, payload):
     if status >= 500:
         return f"HTTP {status} server error"
+    if REDACT:
+        return f"HTTP {status}"
     return f"HTTP {status} {str(payload)[:200]}"
 
 
@@ -189,7 +217,7 @@ class PreheaderText(HTMLParser):
 
 
 def block_text(html):
-    has_pad = re.search(r'<span[^>]*class="[^"]*\bmg-pad\b', html) is not None
+    has_pad = re.search(r"""<span[^>]*class=["'][^"']*\bmg-pad\b""", html) is not None
     p = PreheaderText(stop_at_any_span=not has_pad)
     p.feed(html)
     if not p.found:
@@ -224,10 +252,10 @@ def patch_preview(mid, first_definition, new_text, cid=None):
     if cid is not None:
         stt = campaign_status(cid)
         if stt != "Draft":
-            return False, f"campaign {cid} is {stt!r}, not Draft - skipped"
+            return False, SKIP_PREFIX + f"campaign {cid} is {stt!r}, not Draft"
     cur = get_message(mid)
     if cur != first_definition:
-        return False, "definition changed since the first read (someone editing?) - skipped"
+        return False, SKIP_PREFIX + "definition changed since the first read (someone editing?)"
     new_def = copy.deepcopy(cur)
     new_def["content"]["preview_text"] = new_text
     if new_def.get("label") is None:
@@ -248,7 +276,7 @@ def patch_preview(mid, first_definition, new_text, cid=None):
     if after is None:
         return False, "re-read failed"
     if after["content"].get("preview_text") != new_text:
-        return False, f"re-read after ~18s still shows preview_text={after['content'].get('preview_text')!r}"
+        return False, f"re-read after ~18s still shows preview_text={txt(after['content'].get('preview_text'))}"
     a, b = copy.deepcopy(cur), copy.deepcopy(after)
     a["content"].pop("preview_text", None)
     b["content"].pop("preview_text", None)
@@ -305,8 +333,9 @@ def run_campaign(cid, apply, force):
                 ok, msg = patch_preview(mid, definition, block, cid)
             except ApiError as e:
                 ok, msg = False, str(e)
-            print(f"  APPLY {label} / {mid}: {'OK' if ok else 'FAILED'} - {msg}")
-            failures += 0 if ok else 1
+            skipped = not ok and msg.startswith(SKIP_PREFIX)
+            print(f"  APPLY {label} / {mid}: {'OK' if ok else 'SKIPPED' if skipped else 'FAILED'} - {msg}")
+            failures += 0 if ok or skipped else 1
     elif todo:
         print("Dry run: nothing changed. Re-run with --apply to set each DIFF field to its block text.")
     return 1 if failures else 0
@@ -358,79 +387,123 @@ def run_all_drafts(apply):
         return 0
     cache = state.setdefault("messages", {})
     failures = 0
+    deadline = time.time() + TIME_BUDGET
     try:
         msgs = list_draft_messages()
         live = {m[2] for m in msgs}
         for mid in list(cache):              # forget messages that are no longer in a Draft campaign
             if mid not in live:
                 del cache[mid]
-        block_ids = [m for m in msgs if cache.get(m[2], {}).get("block") is not None]
+        block_ids = sorted((m for m in msgs if cache.get(m[2], {}).get("block") is not None), key=lambda m: m[2])
+        brot = state.get("block_rotation", 0) % max(len(block_ids), 1)
+        block_ids = block_ids[brot:] + block_ids[:brot]   # vary the start so a 429 never starves the tail
+        state["block_rotation"] = brot + 1
         new_ids = [m for m in msgs if m[2] not in cache][:SEED_PER_RUN]
         noblock = sorted((m for m in msgs if m[2] in cache and cache[m[2]].get("block") is None), key=lambda m: m[2])
         rot = state.get("rotation", 0) % max(len(noblock), 1)
         rotating = (noblock[rot:] + noblock[:rot])[:ROTATE_PER_RUN]
         state["rotation"] = rot + ROTATE_PER_RUN
         for cid, cname, mid, definition, tid in block_ids + new_ids + rotating:
+            if time.time() > deadline:
+                log(f"time budget ({TIME_BUDGET}s) reached; remaining messages are checked next run", True)
+                break
             entry = cache.get(mid)
             st, t = api("GET", f"/api/campaign-messages/{mid}/template/?fields[template]=updated")
             if st != 200 or not t.get("data"):
-                if 400 <= st < 500:
+                if st in PARK_STATUSES:
                     # Klaviyo itself can't load this message's template (e.g. 422 "Failed to load
                     # definition"); permanent for that message, so park it on the slow rotation.
                     if (entry or {}).get("error") != st:
-                        log(f"WARN {cname!r} msg {mid}: template read {describe(st, t)}", True)
+                        log(f"WARN {nm(cname)} msg {mid}: template read {describe(st, t)}", True)
                     cache[mid] = {"template": None, "updated": None, "block": None, "error": st}
                 elif st != 200:
-                    log(f"ERROR {cname!r} msg {mid}: template read {describe(st, t)}", True)
+                    log(f"ERROR {nm(cname)} msg {mid}: template read {describe(st, t)}", True)
                     failures += 1
                 else:
                     cache[mid] = {"template": None, "updated": None, "block": None}
                 continue
             tid, upd = t["data"]["id"], t["data"]["attributes"].get("updated")
             if not entry or entry.get("template") != tid or entry.get("updated") != upd:
-                st, full = api("GET", f"/api/templates/{tid}/")
-                if 400 <= st < 500:
-                    if (entry or {}).get("error") != st:
-                        log(f"WARN {cname!r} msg {mid}: template {tid} html read {describe(st, full)}", True)
+                st, block = read_block(cname, mid, tid, entry)
+                if st in PARK_STATUSES:
                     cache[mid] = {"template": tid, "updated": upd, "block": None, "error": st}
                     continue
                 if st != 200:
-                    log(f"ERROR {cname!r} msg {mid}: template {tid} html read {describe(st, full)}", True)
                     failures += 1
                     continue
-                block = block_text(full["data"]["attributes"].get("html") or "")
-                cache[mid] = {"template": tid, "updated": upd, "block": block}
-            block = cache[mid]["block"]
-            if block is None or is_placeholder(block):
+                cache[mid] = {"template": tid, "updated": upd, "block": fp(block),
+                              "placeholder": block is not None and is_placeholder(block)}
+            # The cache keeps only a fingerprint of the block text (it lives in a public repo's Actions cache).
+            if cache[mid]["block"] is None or cache[mid].get("placeholder"):
                 continue                      # no block, or placeholder text: never synced automatically
             field = (definition.get("content") or {}).get("preview_text") or ""
-            if block == field:
+            if cache[mid]["block"] == fp(field):
                 continue
             label = definition.get("label") or ""
+            if cache[mid].get("failed_block") == cache[mid]["block"] and cache[mid].get("fail_count", 0) >= MAX_SAME_FAILURES:
+                continue                      # this exact text already failed repeatedly; retried once the block changes
+            # Fetch the actual text now (never from cache), so a stale cache can never be written.
+            st, block = read_block(cname, mid, tid, entry)
+            if st != 200:
+                failures += 0 if st in PARK_STATUSES else 1
+                continue
+            cache[mid]["block"] = fp(block)
+            cache[mid]["placeholder"] = block is not None and is_placeholder(block)
+            if block is None or cache[mid]["placeholder"] or block == field:
+                continue
             if not apply:
-                log(f"DIFF (dry run) {cname!r} / {label} msg {mid}: field={field!r} block={block!r}", True)
+                log(f"DIFF (dry run) {nm(cname)} / {nm(label)} msg {mid}: field={txt(field)} block={txt(block)}", True)
                 continue
             try:
                 ok, msg = patch_preview(mid, definition, block, cid)
             except ApiError as e:
                 ok, msg = False, str(e)
+            except RateLimited:
+                log(f"FAILED {nm(cname)} / {nm(label)} msg {mid} tpl {tid}: rate limited mid-update (PATCH may be applied but unverified)", True)
+                failures += 1
+                raise
             if ok:
-                log(f"SYNCED {cname!r} / {label} msg {mid} tpl {tid}: {field!r} -> {block!r}", True)
+                cache[mid].pop("failed_block", None)
+                cache[mid].pop("fail_count", None)
+                log(f"SYNCED {nm(cname)} / {nm(label)} msg {mid} tpl {tid}: {txt(field)} -> {txt(block)}", True)
+            elif msg.startswith(SKIP_PREFIX):
+                log(f"INFO {nm(cname)} / {nm(label)} msg {mid}: {msg}", True)   # someone editing: retried next run
             else:
-                log(f"FAILED {cname!r} / {label} msg {mid} tpl {tid}: {msg}", True)
+                same = cache[mid].get("failed_block") == fp(block)
+                cache[mid]["failed_block"] = fp(block)
+                cache[mid]["fail_count"] = cache[mid].get("fail_count", 0) + 1 if same else 1
+                paused = cache[mid]["fail_count"] >= MAX_SAME_FAILURES
+                log(f"FAILED {nm(cname)} / {nm(label)} msg {mid} tpl {tid}: {msg}"
+                    + (f" (failed {cache[mid]['fail_count']}x; paused until the block text changes)" if paused else ""), True)
                 failures += 1
     except RateLimited as e:
         state["backoff_until"] = time.time() + e.retry_after
-        log(f"RATE LIMITED (429): backing off {e.retry_after}s", True)
+        state["backoffs"] = state.get("backoffs", 0) + 1
+        log(f"RATE LIMITED (429): backing off {e.retry_after}s (consecutive back-offs: {state['backoffs']})", True)
         save_state(state)
-        return 0
+        return 1 if failures or state["backoffs"] >= MAX_BACKOFFS else 0
     except ApiError as e:
         log(f"ERROR {e}", True)
         failures += 1
+    state["backoffs"] = 0
     save_state(state)
     if not QUIET:
         print(f"api calls this run: {CALLS}")
     return 1 if failures else 0
+
+
+def read_block(cname, mid, tid, entry):
+    """Full template read -> (status, block_text_or_None). 200 = ok; a PARK_STATUSES code = Klaviyo can't
+    serve this template (WARN once, not a failure); anything else = counted failure (already logged)."""
+    st, full = api("GET", f"/api/templates/{tid}/")
+    if st == 200:
+        return 200, block_text(full["data"]["attributes"].get("html") or "")
+    if st in PARK_STATUSES:
+        if (entry or {}).get("error") != st:
+            log(f"WARN {nm(cname)} msg {mid}: template {tid} html read {describe(st, full)}", True)
+    else:
+        log(f"ERROR {nm(cname)} msg {mid}: template {tid} html read {describe(st, full)}", True)
+    return st, None
 
 
 def main():

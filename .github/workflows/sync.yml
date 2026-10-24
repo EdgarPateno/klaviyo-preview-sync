@@ -4,7 +4,7 @@ name: Sync preview text
 # Klaviyo "Preview text" field. Template html is never written.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub's minimum; runs can start a few minutes late
+    - cron: "2-59/5 * * * *"   # every 5 min, off the congested :00; runs can start a few minutes late
   workflow_dispatch:        # "Run workflow" button for an immediate sync
 
 permissions:
@@ -19,10 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Restore sync state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .sync_state.json
           key: sync-state-${{ github.run_id }}
@@ -32,6 +34,8 @@ jobs:
         env:
           KLAVIYO_API_KEY: ${{ secrets.KLAVIYO_API_KEY }}
           SYNC_SEED_PER_RUN: "50"
+          SYNC_REDACT: "1"           # public repo: keep campaign names and copy out of the logs
+          SYNC_TIME_BUDGET: "170"
         run: |
           if [ -z "$KLAVIYO_API_KEY" ]; then
             echo "::error::Repo secret KLAVIYO_API_KEY is not set (Settings > Secrets and variables > Actions)."
@@ -41,7 +45,7 @@ jobs:
 
       - name: Save sync state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .sync_state.json
           key: sync-state-${{ github.run_id }}
