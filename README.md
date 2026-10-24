@@ -9,8 +9,10 @@ editor, and this job copies its text into the field so the campaign screen shows
 
 ## How it runs
 
-- `.github/workflows/sync.yml` runs every 5 minutes (GitHub's minimum, often a few minutes late) and on
-  demand via **Actions > Sync preview text > Run workflow**.
+- `.github/workflows/sync.yml` is started every 2 minutes by an external cron-job.org job that calls the
+  `workflow_dispatch` API with a fine-grained token limited to Actions on this repo. GitHub's own 5-minute
+  schedule is kept as a backup (it is best-effort and can be late), and **Actions > Sync preview text >
+  Run workflow** starts it by hand.
 - Only **Draft** email campaigns are touched, only the Preview text field is written, and template html is
   never changed.
 - Empty block text and the base-template placeholder `[REPLACE]` are never copied.

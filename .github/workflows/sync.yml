@@ -5,7 +5,7 @@ name: Sync preview text
 on:
   schedule:
     - cron: "2-59/5 * * * *"   # every 5 min, off the congested :00; runs can start a few minutes late
-  workflow_dispatch:        # "Run workflow" button for an immediate sync
+  workflow_dispatch:        # "Run workflow" button; also called every 2 min by cron-job.org (reliable trigger)
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -35,7 +35,7 @@ jobs:
           KLAVIYO_API_KEY: ${{ secrets.KLAVIYO_API_KEY }}
           SYNC_SEED_PER_RUN: "50"
           SYNC_REDACT: "1"           # public repo: keep campaign names and copy out of the logs
-          SYNC_TIME_BUDGET: "170"
+          SYNC_TIME_BUDGET: "100"   # finish well inside the 2-minute external trigger interval
         run: |
           if [ -z "$KLAVIYO_API_KEY" ]; then
             echo "::error::Repo secret KLAVIYO_API_KEY is not set (Settings > Secrets and variables > Actions)."
