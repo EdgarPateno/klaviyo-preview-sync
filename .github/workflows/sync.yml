@@ -34,6 +34,7 @@ jobs:
         env:
           KLAVIYO_API_KEY: ${{ secrets.KLAVIYO_API_KEY }}
           SYNC_SEED_PER_RUN: "50"
+          SYNC_ROTATE_PER_RUN: "25"  # every no-block draft re-checked within a few minutes
           SYNC_REDACT: "1"           # public repo: keep campaign names and copy out of the logs
           SYNC_TIME_BUDGET: "100"   # finish well inside the 2-minute external trigger interval
         run: |

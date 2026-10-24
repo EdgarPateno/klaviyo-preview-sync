@@ -59,7 +59,7 @@ STATE_PATH = os.path.join(HERE, ".sync_state.json")
 LOG_PATH = os.path.join(HERE, "sync_preview_text.log")
 LOCK_PATH = os.path.join(HERE, ".sync_preview_text.lock")
 LOG_CAP = 1_000_000
-ROTATE_PER_RUN = 5     # non-block messages re-checked per run
+ROTATE_PER_RUN = int(os.environ.get("SYNC_ROTATE_PER_RUN", "5"))  # non-block messages re-checked per run
 SEED_PER_RUN = int(os.environ.get("SYNC_SEED_PER_RUN", "15"))  # uncached messages fetched per run
 # invisible characters used in the preheader padding / that may trail the text
 INVISIBLE = "\u200c\u00a0\u200b\u034f\u200a\ufeff\u00ad\u2060\u200d"
@@ -402,11 +402,17 @@ def run_all_drafts(apply):
         block_ids = block_ids[brot:] + block_ids[:brot]   # vary the start so a 429 never starves the tail
         state["block_rotation"] = brot + 1
         new_ids = [m for m in msgs if m[2] not in cache][:SEED_PER_RUN]
-        noblock = sorted((m for m in msgs if m[2] in cache and cache[m[2]].get("block") is None), key=lambda m: m[2])
+        # A message whose assigned template changed (e.g. a variation restored onto a new template) is
+        # re-checked now instead of waiting for the slow no-block rotation.
+        switched = [m for m in msgs if m[2] in cache and cache[m[2]].get("block") is None
+                    and m[4] and cache[m[2]].get("template") != m[4]]
+        switched_ids = {m[2] for m in switched}
+        noblock = sorted((m for m in msgs if m[2] in cache and cache[m[2]].get("block") is None
+                          and m[2] not in switched_ids), key=lambda m: m[2])
         rot = state.get("rotation", 0) % max(len(noblock), 1)
         rotating = (noblock[rot:] + noblock[:rot])[:ROTATE_PER_RUN]
         state["rotation"] = rot + ROTATE_PER_RUN
-        for cid, cname, mid, definition, tid in block_ids + new_ids + rotating:
+        for cid, cname, mid, definition, tid in block_ids + switched + new_ids + rotating:
             if time.time() > deadline:
                 log(f"time budget ({TIME_BUDGET}s) reached; remaining messages are checked next run", True)
                 break
