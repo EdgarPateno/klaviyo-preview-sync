@@ -1,0 +1,5 @@
+.sync_state.json
+.sync_state.json.tmp
+.sync_preview_text.lock
+sync_preview_text.log
+__pycache__/

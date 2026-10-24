@@ -1,0 +1,47 @@
+name: Sync preview text
+
+# Copies the hidden yellow preview block text of every Draft email campaign into its
+# Klaviyo "Preview text" field. Template html is never written.
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub's minimum; runs can start a few minutes late
+  workflow_dispatch:        # "Run workflow" button for an immediate sync
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-preview-text
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore sync state
+        uses: actions/cache/restore@v4
+        with:
+          path: .sync_state.json
+          key: sync-state-${{ github.run_id }}
+          restore-keys: sync-state-
+
+      - name: Sync Draft campaigns
+        env:
+          KLAVIYO_API_KEY: ${{ secrets.KLAVIYO_API_KEY }}
+          SYNC_SEED_PER_RUN: "50"
+        run: |
+          if [ -z "$KLAVIYO_API_KEY" ]; then
+            echo "::error::Repo secret KLAVIYO_API_KEY is not set (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          python3 sync_preview_text.py --all-drafts --apply
+
+      - name: Save sync state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sync_state.json
+          key: sync-state-${{ github.run_id }}
