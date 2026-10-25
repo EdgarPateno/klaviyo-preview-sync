@@ -25,6 +25,7 @@ Safety (both modes):
     SYNC_SEED_PER_RUN (default 15) per run; state lives in .sync_state.json next to this script
     (persisted between Actions runs with actions/cache);
   * HTTP 429 -> back off (Retry-After, min 120 s) and exit 0; a lock file makes overlapping runs exit at once;
+  * a GET that times out or hits a network error is retried once; writes are never retried;
   * a template that Klaviyo itself cannot load (HTTP 404/422) is logged as WARN and not counted as a failure;
     any other 4xx (e.g. 401/403 after a key-scope change) is an ERROR;
   * the template html is re-read right before each write, so a stale cache is never written;
@@ -41,10 +42,10 @@ import copy
 import datetime
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
-import socket
 import sys
 import time
 import urllib.error
@@ -137,7 +138,20 @@ def log(msg, always=False):
 
 
 def api(method, path, body=None):
-    """Return (status, json). Raises ApiError on network errors/timeouts and RateLimited on 429."""
+    """Return (status, json). Raises ApiError on network errors/timeouts and RateLimited on 429.
+    A GET that hits a network error/timeout is retried once (2 attempts x 30 s idle timeout + 2 s pause);
+    writes are never retried."""
+    if method == "GET":
+        try:
+            return _api_once(method, path, body, timeout=30)
+        except ApiError as e:
+            log(f"WARN retrying: {e}", True)
+            time.sleep(2)
+            return _api_once(method, path, body, timeout=30)
+    return _api_once(method, path, body, timeout=60)
+
+
+def _api_once(method, path, body, timeout):
     global CALLS
     CALLS += 1
     data = json.dumps(body).encode() if body is not None else None
@@ -146,7 +160,7 @@ def api(method, path, body=None):
         "Authorization": "Klaviyo-API-Key " + KEY, "revision": REVISION,
         "accept": "application/vnd.api+json", "content-type": "application/vnd.api+json"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             txt = resp.read().decode()
             return resp.status, (json.loads(txt) if txt else None)
     except urllib.error.HTTPError as e:
@@ -156,12 +170,15 @@ def api(method, path, body=None):
             except ValueError:
                 ra = 0
             raise RateLimited(max(ra, 120))
-        txt = e.read().decode()
+        try:
+            txt = e.read().decode()
+        except (OSError, http.client.HTTPException):
+            txt = ""                          # error body lost in transit; the status is what matters
         try:
             return e.code, json.loads(txt)
         except ValueError:
             return e.code, txt
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:   # OSError: timeouts, resets, TLS drops
         raise ApiError(f"{method} {path.split('?')[0]}: network error/timeout: {e}")
 
 
